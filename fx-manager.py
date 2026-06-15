@@ -4,45 +4,120 @@ fx-manager.py — Firefox Extension & Profile Backup Manager
 
 Commands:
   sync     Sync UUID map and extension storage to backup zip
-  restore  (todo) Bootstrap a new Firefox profile from backup zip
+  init     Bootstrap a new Firefox profile from a transfer package
 
 Usage:
   fx-manager.py sync [--profile PATH] [--backup PATH] [--export]
-  fx-manager.py restore [--profile PATH] [--backup PATH]
+  fx-manager.py init [--profile PATH] [--firefox PATH]
 """
 
 import argparse
+import configparser
 import glob
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import zipfile
 
 
 # ---------------------------------------------------------------------------
-# User configuration — edit these if your paths differ
+# Constants — only true hardcodes, everything else lives in fx-manager.conf
 # ---------------------------------------------------------------------------
 
-BACKUP_DIR = os.path.join(os.path.expanduser("~"), "Documents", "firefox-extension-manager")
-BACKUP_PATH = os.path.join(BACKUP_DIR, "firefox-backup.zip")
+CONFIG_FILENAME = "fx-manager.conf"
 
+DEFAULT_BACKUP_DIR      = os.path.join(os.path.expanduser("~"), "Documents", "firefox-extension-manager")
+DEFAULT_BACKUP_FILENAME = "firefox-backup.zip"
+DEFAULT_TRANSFER_FILENAME = "firefox-transfer.zip"
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-BACKUP_FILENAME = "firefox-backup.zip"
-TRANSFER_FILENAME = "firefox-transfer.zip"
-UUID_PREF_KEY = "extensions.webextensions.uuids"
-COMMENT_HEADER = "// Extensions UUID Map (managed by fx-manager.py — do not edit manually)"
-LEGEND_HEADER = "# Firefox Extension Storage Legend"
-UUID_COL_WIDTH = 38
-EXT_ID_COL_WIDTH = 50
+UUID_PREF_KEY       = "extensions.webextensions.uuids"
+COMMENT_HEADER      = "// Extensions UUID Map (managed by fx-manager.py — do not edit manually)"
+LEGEND_HEADER       = "# Firefox Extension Storage Legend"
+UUID_COL_WIDTH      = 38
+EXT_ID_COL_WIDTH    = 50
 UUID_COMMENT_FORMAT = "// {{uuid:<{w1}}} | {{ext_id:<{w2}}} | {{name}}".format(
     w1=UUID_COL_WIDTH, w2=EXT_ID_COL_WIDTH
 )
+
+FIREFOX_COMMON_PATHS_LINUX = [
+    "/usr/bin/firefox",
+    "/usr/lib/firefox/firefox",
+    "/snap/bin/firefox",
+    "flatpak run org.mozilla.firefox",
+]
+FIREFOX_COMMON_PATHS_WIN = [
+    os.path.join(os.environ.get("PROGRAMFILES", "C:\\Program Files"), "Mozilla Firefox", "firefox.exe"),
+    os.path.join(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"), "Mozilla Firefox", "firefox.exe"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Mozilla Firefox", "firefox.exe"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def config_path():
+    return os.path.join(script_dir(), CONFIG_FILENAME)
+
+
+def load_config():
+    """
+    Load fx-manager.conf from script directory.
+    Create it with blank defaults if it doesn't exist.
+    Returns a dict of resolved config values.
+    """
+    cfg = configparser.ConfigParser()
+    cfg_path = config_path()
+
+    if not os.path.isfile(cfg_path):
+        cfg["paths"] = {
+            "backup_dir": "",
+        }
+        cfg["firefox"] = {
+            "bin": "",
+        }
+        with open(cfg_path, "w") as f:
+            cfg.write(f)
+        print(f"Config created: {cfg_path}")
+    else:
+        cfg.read(cfg_path)
+
+    def get(section, key, default):
+        try:
+            val = cfg.get(section, key).strip()
+            return os.path.expanduser(val) if val else default
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return default
+
+    backup_dir  = get("paths", "backup_dir", DEFAULT_BACKUP_DIR)
+    firefox_bin = get("firefox", "bin", "")
+
+    return {
+        "backup_dir":    backup_dir,
+        "backup_path":   os.path.join(backup_dir, DEFAULT_BACKUP_FILENAME),
+        "transfer_path": os.path.join(backup_dir, DEFAULT_TRANSFER_FILENAME),
+        "firefox_bin":   firefox_bin,
+    }
+
+
+def save_config_value(section, key, value):
+    """Write a single value back to the config file."""
+    cfg = configparser.ConfigParser()
+    cfg_path = config_path()
+    if os.path.isfile(cfg_path):
+        cfg.read(cfg_path)
+    if not cfg.has_section(section):
+        cfg.add_section(section)
+    cfg.set(section, key, value)
+    with open(cfg_path, "w") as f:
+        cfg.write(f)
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +150,42 @@ def find_profile(profile_path=None):
     die("Could not find a Firefox profile with prefs.js. Use --profile to specify one.")
 
 
-def find_backup(backup_arg=None):
-    return backup_arg if backup_arg else BACKUP_PATH
+def find_firefox(config, override=None):
+    """
+    Resolve the Firefox executable.
+    Priority: --firefox flag > config > common path detection > ask user.
+    Saves to config if newly detected or provided.
+    """
+    if override:
+        save_config_value("firefox", "bin", override)
+        return override
+
+    if config["firefox_bin"]:
+        return config["firefox_bin"]
+
+    # Try common paths
+    candidates = FIREFOX_COMMON_PATHS_WIN if sys.platform == "win32" else FIREFOX_COMMON_PATHS_LINUX
+    for path in candidates:
+        # Handle flatpak-style commands
+        exe = path.split()[0]
+        if os.path.isfile(exe) or shutil.which(exe):
+            print(f"  Found Firefox: {path}")
+            save_config_value("firefox", "bin", path)
+            return path
+
+    # Ask user
+    print("Could not find Firefox automatically. Tried:")
+    for p in candidates:
+        print(f"  {p}")
+    path = input("Enter path to Firefox executable: ").strip()
+    if not path:
+        die("No Firefox path provided.")
+    save_config_value("firefox", "bin", path)
+    return path
+
+
+def find_backup(config, override=None):
+    return override if override else config["backup_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -114,11 +223,7 @@ def build_pref_line(uuid_map):
 
 
 def build_comment_block(uuid_map, name_map):
-    """
-    Build the full comment block string for the UUID section in user.js.
-    uuid_map: {ext_id: uuid}
-    name_map: {ext_id: name}
-    """
+    """Build the UUID comment block for user.js."""
     lines = [COMMENT_HEADER]
     lines.append("// {:<{w1}} | {:<{w2}} | {}".format(
         "UUID", "Extension ID", "Name", w1=UUID_COL_WIDTH, w2=EXT_ID_COL_WIDTH
@@ -261,16 +366,16 @@ def write_zip(zip_path, userjs_text, legend_text, storage_dir):
     return storage_count
 
 
-def export_transfer(zip_path):
-    """Package manager + backup files into a transfer zip in BACKUP_DIR."""
+def export_transfer(zip_path, config):
+    """Package manager + backup files into a transfer zip in backup_dir."""
     script_path = os.path.abspath(__file__)
-    transfer_path = os.path.join(BACKUP_DIR, TRANSFER_FILENAME)
+    transfer_path = config["transfer_path"]
     tmp_path = transfer_path + ".tmp"
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    os.makedirs(config["backup_dir"], exist_ok=True)
     with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(script_path, "fx-manager.py")
         if os.path.isfile(zip_path):
-            zf.write(zip_path, BACKUP_FILENAME)
+            zf.write(zip_path, DEFAULT_BACKUP_FILENAME)
         else:
             die(f"Backup zip not found at {zip_path} — run sync first.")
     if os.path.exists(transfer_path):
@@ -283,7 +388,7 @@ def export_transfer(zip_path):
 # sync command
 # ---------------------------------------------------------------------------
 
-def cmd_sync(profile, zip_path, export=False):
+def cmd_sync(profile, zip_path, export=False, config=None):
     prefs_path = os.path.join(profile, "prefs.js")
     storage_dir = get_storage_dir(profile)
 
@@ -330,13 +435,123 @@ def cmd_sync(profile, zip_path, export=False):
     storage_count = write_zip(zip_path, userjs_text, legend_text, storage_dir)
 
     # --- Export transfer package if requested ---
-    if export:
+    if export and config:
         print("\nExporting transfer package...")
-        export_transfer(zip_path)
+        export_transfer(zip_path, config)
 
     # --- Summary ---
     mismatch_str = f", {mismatch_count} mismatches corrected" if mismatch_count else ""
     print(f"\nSync complete — {len(prefs_map)} extensions{mismatch_str}, {storage_count} storage folders backed up.")
+
+
+# ---------------------------------------------------------------------------
+# init command
+# ---------------------------------------------------------------------------
+
+def cmd_init(profile, firefox_bin):
+    ref_zip = os.path.join(script_dir(), DEFAULT_BACKUP_FILENAME)
+
+    # --- Check reference zip exists ---
+    if not os.path.isfile(ref_zip):
+        die(
+            f"No backup zip found at {ref_zip}\n"
+            f"  Make sure {DEFAULT_BACKUP_FILENAME} is in the same directory as this script."
+        )
+
+    # --- Check profile is ready ---
+    prefs_path = os.path.join(profile, "prefs.js")
+    if not os.path.isfile(prefs_path):
+        die(
+            "Firefox profile not ready. Please:\n"
+            "  1. Launch Firefox\n"
+            "  2. Sign in to your Firefox account\n"
+            "  3. Wait for extensions to sync\n"
+            "  4. Close Firefox\n"
+            "  5. Run init again"
+        )
+
+    storage_dir = get_storage_dir(profile)
+    userjs_path = os.path.join(profile, "user.js")
+
+    # --- Inject user.js from zip ---
+    userjs_text = read_userjs_from_zip(ref_zip)
+    if not userjs_text:
+        die(f"Could not read user.js from {ref_zip} — zip may be corrupt.")
+
+    existing_userjs = None
+    if os.path.isfile(userjs_path):
+        bak_path = userjs_path + ".bak"
+        shutil.copy2(userjs_path, bak_path)
+        existing_userjs = open(userjs_path, "r", encoding="utf-8").read()
+        print(f"  Existing user.js backed up to {bak_path}")
+
+    with open(userjs_path, "w", encoding="utf-8") as f:
+        f.write(userjs_text)
+    print("  user.js injected into profile")
+
+    # --- Wipe existing moz-extension+++ folders ---
+    wiped = 0
+    if os.path.isdir(storage_dir):
+        for entry in os.listdir(storage_dir):
+            if entry.startswith("moz-extension+++"):
+                shutil.rmtree(os.path.join(storage_dir, entry))
+                wiped += 1
+    print(f"  Wiped {wiped} existing storage folders")
+
+    # --- Extract storage folders from zip ---
+    os.makedirs(storage_dir, exist_ok=True)
+    with zipfile.ZipFile(ref_zip, "r") as zf:
+        for name in zf.namelist():
+            if not name.startswith("storage/default/moz-extension+++"):
+                continue
+            rel = os.path.relpath(name, "storage/default")
+            dest = os.path.join(storage_dir, rel)
+            if name.endswith("/"):
+                os.makedirs(dest, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(name) as src, open(dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+    extracted = len(set(
+        n.split("/")[2] for n in zipfile.ZipFile(ref_zip).namelist()
+        if n.startswith("storage/default/moz-extension+++")
+    ))
+    print(f"  Extracted {extracted} storage folders")
+
+    # --- Launch Firefox, wait for close ---
+    print(f"\n  Launching Firefox ({firefox_bin})...")
+    print("  Please sign in, wait for sync to complete, then close Firefox.")
+    try:
+        cmd = firefox_bin.split() if " " in firefox_bin else [firefox_bin]
+        subprocess.run(cmd, check=False)
+    except (OSError, FileNotFoundError) as e:
+        die(f"Could not launch Firefox: {e}\n  Check the 'bin' value in fx-manager.conf")
+    print("  Firefox closed.")
+
+    # --- Remove injected user.js, restore original if there was one ---
+    if existing_userjs:
+        with open(userjs_path, "w", encoding="utf-8") as f:
+            f.write(existing_userjs)
+        print("  Original user.js restored")
+    else:
+        os.remove(userjs_path)
+        print("  Injected user.js removed")
+
+    # --- Copy reference zip to backup_path ---
+    cfg = load_config()
+    backup_path = cfg["backup_path"]
+    if os.path.isfile(backup_path):
+        print(f"  Warning: existing backup at {backup_path} will be overwritten")
+    os.makedirs(cfg["backup_dir"], exist_ok=True)
+    shutil.copy2(ref_zip, backup_path)
+    print(f"  Reference zip copied to {backup_path}")
+
+    # --- Run sync to correct UUID mismatches and refresh zip ---
+    print("\nRunning sync...")
+    cmd_sync(profile, backup_path, config=cfg)
+
+    print("\nInitialization complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -356,15 +571,24 @@ def main():
     p_sync.add_argument("--backup", help="Path to backup zip file")
     p_sync.add_argument("--export", action="store_true", help="Package script and backup zip into a transfer zip after syncing")
 
-    args = parser.parse_args()
+    # init
+    p_init = sub.add_parser("init", help="Bootstrap a new Firefox profile from a transfer package")
+    p_init.add_argument("--profile", help="Path to Firefox profile directory")
+    p_init.add_argument("--firefox", help="Path to Firefox executable")
 
+    args = parser.parse_args()
+    config = load_config()
     profile = find_profile(args.profile)
-    zip_path = find_backup(args.backup)
     print(f"Profile: {profile}")
-    print(f"Backup:  {zip_path}")
 
     if args.command == "sync":
-        cmd_sync(profile, zip_path, export=args.export)
+        zip_path = find_backup(config, args.backup if hasattr(args, "backup") else None)
+        print(f"Backup:  {zip_path}")
+        cmd_sync(profile, zip_path, export=args.export, config=config)
+
+    elif args.command == "init":
+        firefox_bin = find_firefox(config, args.firefox if hasattr(args, "firefox") else None)
+        cmd_init(profile, firefox_bin)
 
 
 if __name__ == "__main__":
